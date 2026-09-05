@@ -1,4 +1,4 @@
-name: Build TEXARI Android APK
+name: Build TEXARI Android APK V0.2
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
@@ -26,11 +26,12 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Create native TEXARI evaluation app
+      - name: Create TEXARI V0.2 native Android app
         shell: bash
         run: |
           set -e
           mkdir -p app/src/main/java/app/texari/evaluation
+          mkdir -p app/src/main/res/xml
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -61,16 +62,51 @@ jobs:
                   applicationId 'app.texari.evaluation'
                   minSdk 23
                   targetSdk 35
-                  versionCode 1
-                  versionName '0.1.0'
+                  versionCode 2
+                  versionName '0.2.0'
               }
           }
+
+          dependencies {
+              implementation 'androidx.core:core:1.15.0'
+              implementation 'com.google.mlkit:text-recognition:16.0.1'
+          }
+          EOF
+
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <cache-path name="camera" path="." />
+          </paths>
           EOF
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.CAMERA" />
-              <application android:allowBackup="true" android:label="TEXARI" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false"> <activity android:name=".MainActivity" android:screenOrientation="portrait" android:exported="true"> <intent-filter> <action android:name="android.intent.action.MAIN" /> <category android:name="android.intent.category.LAUNCHER" /> </intent-filter> </activity> </application>
+              <application
+                  android:allowBackup="true"
+                  android:label="TEXARI"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="app.texari.evaluation.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
           </manifest>
           EOF
 
@@ -80,185 +116,338 @@ jobs:
           import android.Manifest;
           import android.app.Activity;
           import android.app.AlertDialog;
+          import android.app.ProgressDialog;
           import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
           import android.graphics.Color;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
+          import android.graphics.pdf.PdfRenderer;
+          import android.net.Uri;
           import android.os.Bundle;
+          import android.os.ParcelFileDescriptor;
           import android.provider.MediaStore;
           import android.view.Gravity;
           import android.view.View;
           import android.view.ViewGroup;
           import android.view.Window;
+          import android.view.WindowInsets;
+          import android.view.WindowManager;
           import android.widget.Button;
+          import android.widget.CheckBox;
           import android.widget.EditText;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
+
+          import androidx.core.content.FileProvider;
+
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.File;
+          import java.io.IOException;
+          import java.text.Normalizer;
           import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.LinkedHashMap;
           import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
 
           public class MainActivity extends Activity {
               static final int INK = Color.rgb(21,32,50);
-              static final int MUTED = Color.rgb(107,114,128);
-              static final int BG = Color.rgb(246,245,241);
+              static final int MUTED = Color.rgb(104,111,122);
+              static final int BG = Color.rgb(248,247,243);
               static final int CARD = Color.WHITE;
               static final int VIOLET = Color.rgb(111,99,232);
               static final int VIOLET_SOFT = Color.rgb(236,234,254);
-              static final int GREEN = Color.rgb(61,124,104);
-              static final int AMBER = Color.rgb(169,107,44);
+              static final int GREEN = Color.rgb(49,119,96);
+              static final int GREEN_SOFT = Color.rgb(229,242,236);
+              static final int AMBER = Color.rgb(171,103,36);
+              static final int AMBER_SOFT = Color.rgb(251,239,222);
+              static final int RED = Color.rgb(182,66,66);
+
+              static final int REQ_CAMERA = 100;
+              static final int REQ_IMAGE = 101;
+              static final int REQ_DOC = 102;
+              static final int REQ_CAMERA_PERMISSION = 500;
 
               LinearLayout root, content, nav;
               String active = "Oggi";
               int px;
+              Uri cameraUri;
               final List<Item> items = new ArrayList<>();
+              SharedPreferences prefs;
 
               static class Item {
-                  String title, subtitle, meta, badge, detail;
-                  Item(String t, String s, String m, String b, String d) { title=t; subtitle=s; meta=m; badge=b; detail=d; }
+                  String type="Documento", title="", date="", due="", amount="", category="Altro", subcategory="", context="Personale", status="Salvato", source="", note="", ocr="";
+                  boolean expense=false;
+
+                  JSONObject toJson() {
+                      JSONObject o = new JSONObject();
+                      try {
+                          o.put("type",type); o.put("title",title); o.put("date",date); o.put("due",due); o.put("amount",amount);
+                          o.put("category",category); o.put("subcategory",subcategory); o.put("context",context); o.put("status",status);
+                          o.put("source",source); o.put("note",note); o.put("ocr",ocr); o.put("expense",expense);
+                      } catch(Exception ignored) {}
+                      return o;
+                  }
+
+                  static Item fromJson(JSONObject o) {
+                      Item i = new Item();
+                      i.type=o.optString("type","Documento"); i.title=o.optString("title",""); i.date=o.optString("date","");
+                      i.due=o.optString("due",""); i.amount=o.optString("amount",""); i.category=o.optString("category","Altro");
+                      i.subcategory=o.optString("subcategory",""); i.context=o.optString("context","Personale"); i.status=o.optString("status","Salvato");
+                      i.source=o.optString("source",""); i.note=o.optString("note",""); i.ocr=o.optString("ocr",""); i.expense=o.optBoolean("expense",false);
+                      return i;
+                  }
               }
 
               @Override public void onCreate(Bundle b) {
                   super.onCreate(b);
-                  px = (int)getResources().getDisplayMetrics().density;
+                  px = Math.max(1,(int)getResources().getDisplayMetrics().density);
+                  prefs = getSharedPreferences("texari_v02", MODE_PRIVATE);
                   Window w = getWindow();
                   w.setStatusBarColor(BG);
-                  w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
-                  seed();
+                  w.setNavigationBarColor(BG);
+                  if (android.os.Build.VERSION.SDK_INT >= 23) w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+                  loadItems();
+                  if(items.isEmpty()) seed();
                   buildShell();
                   showToday();
               }
 
               void seed() {
-                  items.add(new Item("Macchina del caffè De'Longhi", "Casa · Cucina", "€549 · 2 set 2026", "Reso tra 6 giorni", "Ricevuta salvata · Garanzia rilevata"));
-                  items.add(new Item("Hotel Roma", "Viaggi · Roma", "21–23 settembre", "Tra 16 giorni", "Prenotazione · Check-in 15:00"));
-                  items.add(new Item("Misura finestra bagno", "Casa · Bagno", "87 × 120 cm", "Contesto salvato", "Nota collegata al progetto Casa"));
+                  Item a=new Item(); a.type="Ricevuta"; a.title="Macchina del caffÃ¨ De'Longhi"; a.date="02/09/2026"; a.amount="549,00"; a.category="Acquisti"; a.subcategory="Elettrodomestici"; a.context="Casa Â· Cucina"; a.status="Reso entro 6 giorni"; a.source="Ricevuta"; a.note="Garanzia collegata"; a.expense=true; items.add(a);
+                  Item b=new Item(); b.type="Prenotazione"; b.title="Hotel Roma"; b.date="21/09/2026"; b.due="23/09/2026"; b.category="Viaggi"; b.context="Viaggi Â· Roma"; b.status="Confermata"; b.source="Prenotazione"; items.add(b);
+                  saveItems();
+              }
+
+              void loadItems(){
+                  try {
+                      JSONArray arr=new JSONArray(prefs.getString("items","[]"));
+                      for(int k=0;k<arr.length();k++) items.add(Item.fromJson(arr.getJSONObject(k)));
+                  }catch(Exception ignored){}
+              }
+
+              void saveItems(){
+                  JSONArray arr=new JSONArray(); for(Item i:items) arr.put(i.toJson()); prefs.edit().putString("items",arr.toString()).apply();
               }
 
               void buildShell() {
                   root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(BG);
                   content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL);
                   root.addView(content, new LinearLayout.LayoutParams(-1,0,1));
-                  nav = new LinearLayout(this); nav.setOrientation(LinearLayout.HORIZONTAL); nav.setGravity(Gravity.CENTER); nav.setPadding(dp(8),dp(5),dp(8),dp(8)); nav.setBackgroundColor(CARD);
-                  root.addView(nav, new LinearLayout.LayoutParams(-1,dp(76)));
+                  nav = new LinearLayout(this); nav.setOrientation(LinearLayout.HORIZONTAL); nav.setGravity(Gravity.CENTER_VERTICAL); nav.setPadding(dp(8),dp(3),dp(8),dp(3)); nav.setBackgroundColor(CARD);
+                  root.addView(nav, new LinearLayout.LayoutParams(-1,dp(68)));
                   setContentView(root);
+                  if (android.os.Build.VERSION.SDK_INT >= 23) {
+                      root.setOnApplyWindowInsetsListener((v,insets)->{
+                          int bottom = 0;
+                          if (android.os.Build.VERSION.SDK_INT >= 30) bottom = insets.getInsets(WindowInsets.Type.navigationBars()).bottom;
+                          else bottom = insets.getSystemWindowInsetBottom();
+                          nav.setPadding(dp(8),dp(3),dp(8),Math.max(dp(3),bottom));
+                          ViewGroup.LayoutParams lp=nav.getLayoutParams(); lp.height=dp(68)+Math.max(0,bottom-dp(3)); nav.setLayoutParams(lp);
+                          return insets;
+                      });
+                  }
                   rebuildNav();
               }
 
               void rebuildNav() {
                   nav.removeAllViews();
                   nav.addView(navButton("Oggi"), weighted());
+                  nav.addView(navButton("Spese"), weighted());
+                  Button add = new Button(this); add.setText("+"); add.setTextSize(26); add.setTextColor(Color.WHITE); add.setAllCaps(false); add.setPadding(0,0,0,dp(2)); add.setBackground(round(VIOLET,22)); add.setOnClickListener(v -> showCapture());
+                  LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(dp(54),dp(54)); ap.setMargins(dp(3),0,dp(3),0); nav.addView(add, ap);
                   nav.addView(navButton("Contesti"), weighted());
-                  Button add = new Button(this); add.setText("+"); add.setTextSize(28); add.setTextColor(Color.WHITE); add.setAllCaps(false); add.setBackground(round(VIOLET,20)); add.setOnClickListener(v -> showCapture());
-                  LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(dp(58),dp(58)); ap.setMargins(dp(4),0,dp(4),dp(10)); nav.addView(add, ap);
                   nav.addView(navButton("Chiedi"), weighted());
-                  nav.addView(navButton("Tu"), weighted());
               }
 
               LinearLayout.LayoutParams weighted() { return new LinearLayout.LayoutParams(0,-1,1); }
               View navButton(String name) {
-                  TextView t = text(name,11, active.equals(name)?VIOLET:MUTED, true);
-                  t.setGravity(Gravity.CENTER); t.setPadding(0,dp(10),0,0);
-                  t.setOnClickListener(v -> { active=name; rebuildNav(); if(name.equals("Oggi"))showToday(); else if(name.equals("Contesti"))showContexts(); else if(name.equals("Chiedi"))showAsk(); else showProfile(); });
+                  TextView t = text(name,11, active.equals(name)?VIOLET:MUTED, active.equals(name));
+                  t.setGravity(Gravity.CENTER); t.setPadding(dp(2),dp(8),dp(2),dp(5));
+                  t.setOnClickListener(v -> { active=name; rebuildNav(); if(name.equals("Oggi"))showToday(); else if(name.equals("Spese"))showExpenses(); else if(name.equals("Contesti"))showContexts(); else showAsk(); });
                   return t;
               }
 
               void pageStart(String title, String subtitle) {
                   content.removeAllViews();
-                  ScrollView sv = new ScrollView(this); sv.setFillViewport(true);
-                  LinearLayout page = new LinearLayout(this); page.setOrientation(LinearLayout.VERTICAL); page.setPadding(dp(20),dp(22),dp(20),dp(30)); sv.addView(page);
-                  page.addView(text("texari",20,VIOLET,true));
-                  space(page,18);
-                  page.addView(text(title,34,INK,true));
-                  TextView sub = text(subtitle,14,MUTED,false); sub.setPadding(0,dp(8),0,dp(22)); page.addView(sub);
-                  content.addView(sv,new LinearLayout.LayoutParams(-1,-1));
-                  content.setTag(page);
+                  ScrollView sv = new ScrollView(this); sv.setFillViewport(true); sv.setClipToPadding(false);
+                  LinearLayout page = new LinearLayout(this); page.setOrientation(LinearLayout.VERTICAL); page.setPadding(dp(20),dp(18),dp(20),dp(34)); sv.addView(page);
+                  page.addView(text("texari",19,VIOLET,true));
+                  space(page,16);
+                  page.addView(text(title,32,INK,true));
+                  TextView sub = text(subtitle,14,MUTED,false); sub.setPadding(0,dp(8),0,dp(20)); page.addView(sub);
+                  content.addView(sv,new LinearLayout.LayoutParams(-1,-1)); content.setTag(page);
               }
-
               LinearLayout page() { return (LinearLayout)content.getTag(); }
 
               void showToday() {
-                  pageStart("Quello che conta, oggi.", "TEXARI riporta in superficie le cose utili nel momento in cui servono.");
+                  pageStart("Quello che conta, oggi.", "Documenti, scadenze e cose importanti quando servono davvero.");
                   LinearLayout p=page();
-                  LinearLayout hero = box(INK,28); hero.setPadding(dp(22),dp(22),dp(22),dp(22));
-                  hero.addView(text("IN EVIDENZA",11,Color.rgb(185,180,255),true));
-                  TextView ht=text("Hai ancora 6 giorni per decidere sulla De'Longhi.",24,Color.WHITE,true); ht.setPadding(0,dp(10),0,dp(8)); hero.addView(ht);
-                  hero.addView(text("Ricevuta e garanzia sono già nello stesso contesto.",14,Color.rgb(200,206,216),false));
-                  Button open=button("Apri contesto",Color.WHITE,INK); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-2,dp(45)); op.setMargins(0,dp(18),0,0); hero.addView(open,op); open.setOnClickListener(v->showDetail(items.get(0)));
-                  p.addView(hero,new LinearLayout.LayoutParams(-1,-2)); space(p,25);
-                  p.addView(text("Prossimamente",18,INK,true)); space(p,10);
-                  for(int i=0;i<Math.min(3,items.size());i++) p.addView(itemCard(items.get(i)));
-                  LinearLayout insight=box(Color.rgb(232,242,238),20); insight.setPadding(dp(17),dp(17),dp(17),dp(17)); insight.addView(text("TEXARI ha collegato qualcosa",15,GREEN,true)); TextView it=text("La ricevuta, la garanzia e la cucina ora appartengono allo stesso contesto.",13,Color.rgb(69,103,93),false); it.setPadding(0,dp(5),0,0); insight.addView(it); p.addView(insight);
+                  Item dueSoon = firstDue();
+                  LinearLayout hero = box(INK,26); hero.setPadding(dp(20),dp(20),dp(20),dp(20));
+                  hero.addView(text("IN EVIDENZA",11,Color.rgb(190,185,255),true));
+                  String heroTitle = dueSoon!=null ? ("Prossima scadenza: "+dueSoon.title) : "Aggiungi il primo documento da analizzare";
+                  TextView ht=text(heroTitle,22,Color.WHITE,true); ht.setPadding(0,dp(10),0,dp(8)); hero.addView(ht);
+                  String heroSub = dueSoon!=null ? ((dueSoon.due.isEmpty()?"":("Scade il "+dueSoon.due+" Â· ")) + dueSoon.category) : "Fotografa una fattura, uno scontrino o importa un PDF.";
+                  hero.addView(text(heroSub,13,Color.rgb(203,209,218),false));
+                  Button open=button(dueSoon!=null?"Apri":"Aggiungi",Color.WHITE,INK); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-2,dp(44)); op.setMargins(0,dp(16),0,0); hero.addView(open,op);
+                  open.setOnClickListener(v->{ if(dueSoon!=null)showDetail(dueSoon); else showCapture(); });
+                  p.addView(hero,new LinearLayout.LayoutParams(-1,-2));
+
+                  space(p,22); p.addView(text("AttivitÃ  recenti",18,INK,true)); space(p,10);
+                  int count=Math.min(4,items.size()); for(int i=0;i<count;i++) p.addView(itemCard(items.get(i)));
+                  space(p,12);
+                  LinearLayout tip=box(GREEN_SOFT,18); tip.setPadding(dp(15),dp(15),dp(15),dp(15)); tip.addView(text("Come funziona adesso",14,GREEN,true)); TextView tt=text("Dopo una foto TEXARI analizza il testo, propone tipo, importo, scadenza e categoria. Tu puoi correggere tutto prima di salvare.",12,Color.rgb(57,103,88),false); tt.setPadding(0,dp(4),0,0); tip.addView(tt); p.addView(tip);
+              }
+
+              Item firstDue(){ for(Item i:items) if(!i.due.isEmpty() && !i.status.toLowerCase(Locale.ROOT).contains("pagat")) return i; return null; }
+
+              void showExpenses() {
+                  pageStart("Spese", "Il tuo mese, costruito automaticamente dai documenti che salvi.");
+                  LinearLayout p=page();
+                  double total=0; Map<String,Double> cats=new LinkedHashMap<>();
+                  for(Item i:items){ if(!i.expense)continue; double v=parseAmount(i.amount); total+=v; String c=i.category.isEmpty()?"Altro":i.category; cats.put(c,cats.getOrDefault(c,0.0)+v); }
+                  LinearLayout summary=box(INK,24); summary.setPadding(dp(20),dp(20),dp(20),dp(20)); summary.addView(text("SETTEMBRE 2026",11,Color.rgb(188,185,224),true)); TextView val=text(euro(total),30,Color.WHITE,true); val.setPadding(0,dp(6),0,0); summary.addView(val); summary.addView(text("Spese registrate",13,Color.rgb(205,210,220),false)); p.addView(summary);
+                  space(p,20); p.addView(text("Per categoria",18,INK,true)); space(p,10);
+                  if(cats.isEmpty()) p.addView(text("Nessuna spesa registrata. Aggiungi una fattura o uno scontrino.",14,MUTED,false));
+                  for(Map.Entry<String,Double> e:cats.entrySet()) expenseRow(p,e.getKey(),e.getValue(),total);
+                  space(p,20); p.addView(text("Documenti di spesa",18,INK,true)); space(p,10);
+                  for(Item i:items) if(i.expense) p.addView(itemCard(i));
+              }
+
+              void expenseRow(LinearLayout p,String name,double value,double total){
+                  LinearLayout row=box(CARD,18); row.setPadding(dp(15),dp(14),dp(15),dp(14));
+                  LinearLayout top=new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL); top.addView(text(name,14,INK,true),new LinearLayout.LayoutParams(0,-2,1)); top.addView(text(euro(value),14,INK,true)); row.addView(top);
+                  TextView pct=text(total>0?String.format(Locale.ITALY,"%.0f%% del mese",(value/total)*100):"",11,MUTED,false); pct.setPadding(0,dp(3),0,0); row.addView(pct);
+                  LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2); lp.setMargins(0,0,0,dp(8)); p.addView(row,lp);
               }
 
               void showContexts() {
-                  pageStart("I tuoi contesti.", "Non cartelle: gruppi di cose che hanno senso insieme.");
-                  LinearLayout p=page();
-                  contextRow(p,"Casa","8 elementi","Misure · acquisti · garanzie");
-                  contextRow(p,"Viaggi","3 elementi","Prenotazioni · luoghi · idee");
-                  contextRow(p,"Acquisti","6 elementi","Ricevute · resi · prodotti");
-                  contextRow(p,"Documenti","4 elementi","PDF · scadenze · note");
-                  space(p,18); p.addView(text("Tutto ciò che hai salvato",18,INK,true)); space(p,10);
-                  for(Item i:items)p.addView(itemCard(i));
+                  pageStart("Contesti", "Una cosa puÃ² appartenere a piÃ¹ parti della tua vita senza doverla archiviare due volte.");
+                  LinearLayout p=page(); Map<String,Integer> counts=new LinkedHashMap<>(); for(Item i:items){String c=i.context.isEmpty()?"Personale":i.context;counts.put(c,counts.getOrDefault(c,0)+1);} for(Map.Entry<String,Integer> e:counts.entrySet()) contextRow(p,e.getKey(),e.getValue()+" elementi");
+                  space(p,18); p.addView(text("Tutto ciÃ² che hai salvato",18,INK,true)); space(p,10); for(Item i:items)p.addView(itemCard(i));
               }
 
-              void contextRow(LinearLayout p,String a,String b,String c) {
-                  LinearLayout row=box(CARD,19); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(dp(16),dp(15),dp(16),dp(15));
-                  TextView dot=text("●",15,VIOLET,true); row.addView(dot,new LinearLayout.LayoutParams(dp(28),-2));
-                  LinearLayout mid=new LinearLayout(this); mid.setOrientation(LinearLayout.VERTICAL); mid.addView(text(a,17,INK,true)); mid.addView(text(c,12,MUTED,false)); row.addView(mid,new LinearLayout.LayoutParams(0,-2,1)); row.addView(text(b,12,MUTED,false));
-                  LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2); rp.setMargins(0,0,0,dp(9)); p.addView(row,rp);
+              void contextRow(LinearLayout p,String a,String b) {
+                  LinearLayout row=box(CARD,18); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(dp(15),dp(15),dp(15),dp(15));
+                  TextView dot=text("â—",14,VIOLET,true); row.addView(dot,new LinearLayout.LayoutParams(dp(26),-2)); row.addView(text(a,15,INK,true),new LinearLayout.LayoutParams(0,-2,1)); row.addView(text(b,12,MUTED,false)); LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2); rp.setMargins(0,0,0,dp(8)); p.addView(row,rp);
               }
 
               void showAsk() {
-                  pageStart("Chiedi a TEXARI.", "Non devi ricordare il nome del file. Descrivi semplicemente ciò che stai cercando.");
-                  LinearLayout p=page();
-                  LinearLayout ask=box(CARD,20); ask.setPadding(dp(15),dp(15),dp(15),dp(15));
-                  EditText q=new EditText(this); q.setHint("Es. Quanto avevo pagato la macchina del caffè?"); q.setTextColor(INK); q.setHintTextColor(Color.rgb(148,153,163)); q.setTextSize(15); q.setMinHeight(dp(90)); q.setGravity(Gravity.TOP); q.setBackgroundColor(Color.TRANSPARENT); ask.addView(q,new LinearLayout.LayoutParams(-1,-2));
-                  Button send=button("Chiedi",VIOLET,Color.WHITE); ask.addView(send,new LinearLayout.LayoutParams(-1,dp(48))); p.addView(ask);
-                  TextView answer=text("",15,Color.WHITE,false); LinearLayout answerBox=box(INK,20); answerBox.setPadding(dp(18),dp(18),dp(18),dp(18)); LinearLayout.LayoutParams abp=new LinearLayout.LayoutParams(-1,-2); abp.setMargins(0,dp(14),0,0); answerBox.addView(answer); p.addView(answerBox,abp); answerBox.setVisibility(View.GONE);
-                  send.setOnClickListener(v->{ String z=q.getText().toString().toLowerCase(); String r; if(z.contains("caff")||z.contains("delonghi"))r="Hai salvato una De'Longhi da €549, acquistata il 2 settembre. Ricevuta e garanzia sono collegate a Casa → Cucina."; else if(z.contains("finestra")||z.contains("bagno"))r="La misura salvata per la finestra del bagno è 87 × 120 cm."; else if(z.contains("roma")||z.contains("hotel"))r="Hai una prenotazione a Roma dal 21 al 23 settembre, con check-in alle 15:00."; else r="Questa è la V0.1 dimostrativa. La prossima versione collegherà davvero l'AI alla tua memoria personale."; answer.setText(r); answerBox.setVisibility(View.VISIBLE); });
+                  pageStart("Chiedi a TEXARI", "Cerca tra ciÃ² che hai salvato e fai domande anche sulle tue spese.");
+                  LinearLayout p=page(); LinearLayout ask=box(CARD,18); ask.setPadding(dp(14),dp(14),dp(14),dp(14));
+                  EditText q=input("Es. Quanto ho speso in Alimentari?"); q.setMinHeight(dp(92)); q.setGravity(Gravity.TOP); ask.addView(q,new LinearLayout.LayoutParams(-1,-2)); Button send=button("Chiedi",VIOLET,Color.WHITE); LinearLayout.LayoutParams sp=new LinearLayout.LayoutParams(-1,dp(46)); sp.setMargins(0,dp(8),0,0); ask.addView(send,sp); p.addView(ask);
+                  LinearLayout answerBox=box(INK,18); answerBox.setPadding(dp(16),dp(16),dp(16),dp(16)); TextView answer=text("",14,Color.WHITE,false); answerBox.addView(answer); LinearLayout.LayoutParams alp=new LinearLayout.LayoutParams(-1,-2); alp.setMargins(0,dp(12),0,0); p.addView(answerBox,alp); answerBox.setVisibility(View.GONE);
+                  send.setOnClickListener(v->{ String z=norm(q.getText().toString()); String r="Non ho trovato abbastanza informazioni."; if(z.contains("spes")||z.contains("gast")){double t=0;for(Item i:items)if(i.expense)t+=parseAmount(i.amount);r="Hai registrato "+euro(t)+" di spese nei documenti salvati."; for(Item i:items){String c=norm(i.category); if(!c.isEmpty()&&z.contains(c)){double s=0;for(Item j:items)if(j.expense&&norm(j.category).equals(c))s+=parseAmount(j.amount);r="Per "+i.category+" hai registrato "+euro(s)+".";break;}} } else { for(Item i:items) if(z.contains(norm(i.title)) || norm(i.title).contains(z)){r=i.title+": "+(i.amount.isEmpty()?"":("â‚¬"+i.amount+" Â· "))+i.category+(i.due.isEmpty()?"":(" Â· scadenza "+i.due)); break;} } answer.setText(r); answerBox.setVisibility(View.VISIBLE); });
               }
-
-              void showProfile() {
-                  pageStart("Il tuo TEXARI.", "Una memoria personale costruita intorno al tuo contesto.");
-                  LinearLayout p=page();
-                  LinearLayout profile=box(CARD,20); profile.setPadding(dp(18),dp(18),dp(18),dp(18)); profile.addView(text("A",24,VIOLET,true),new LinearLayout.LayoutParams(dp(50),dp(50))); LinearLayout info=new LinearLayout(this); info.setOrientation(LinearLayout.VERTICAL); info.addView(text("Profilo di valutazione",16,INK,true)); info.addView(text("TEXARI V0.1 · locale",12,MUTED,false)); profile.addView(info); p.addView(profile);
-                  space(p,24); p.addView(text("Principi del prodotto",18,INK,true));
-                  setting(p,"Privato per impostazione predefinita"); setting(p,"Tu scegli cosa salvare"); setting(p,"Le fonti restano sempre visibili"); setting(p,"L'AI propone, tu confermi");
-              }
-
-              void setting(LinearLayout p,String x){ LinearLayout r=new LinearLayout(this); r.setOrientation(LinearLayout.HORIZONTAL); r.setPadding(0,dp(14),0,dp(14)); r.addView(text("✓",17,GREEN,true),new LinearLayout.LayoutParams(dp(28),-2)); r.addView(text(x,14,INK,false)); p.addView(r); }
 
               View itemCard(Item i) {
-                  LinearLayout card=box(CARD,20); card.setPadding(dp(16),dp(16),dp(16),dp(16));
-                  card.addView(text(i.title,16,INK,true)); TextView sub=text(i.subtitle,12,MUTED,false); sub.setPadding(0,dp(3),0,dp(13)); card.addView(sub); card.addView(text(i.meta,14,INK,false)); TextView badge=text(i.badge,11,VIOLET,true); badge.setPadding(dp(10),dp(7),dp(10),dp(7)); badge.setBackground(round(VIOLET_SOFT,50)); LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2); bp.setMargins(0,dp(12),0,0); card.addView(badge,bp); card.setOnClickListener(v->showDetail(i)); LinearLayout outer=new LinearLayout(this); outer.addView(card,new LinearLayout.LayoutParams(-1,-2)); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-1,-2); op.setMargins(0,0,0,dp(10)); outer.setLayoutParams(op); return outer;
+                  LinearLayout card=box(CARD,18); card.setPadding(dp(15),dp(15),dp(15),dp(15));
+                  LinearLayout top=new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL); top.addView(text(i.type.toUpperCase(Locale.ROOT),10,VIOLET,true),new LinearLayout.LayoutParams(0,-2,1)); if(i.expense&&!i.amount.isEmpty())top.addView(text("â‚¬"+i.amount,14,INK,true)); card.addView(top);
+                  TextView title=text(i.title.isEmpty()?"Elemento senza titolo":i.title,16,INK,true); title.setPadding(0,dp(7),0,dp(3)); card.addView(title);
+                  String meta=i.category+(i.subcategory.isEmpty()?"":" Â· "+i.subcategory)+(i.date.isEmpty()?"":" Â· "+i.date); card.addView(text(meta,12,MUTED,false));
+                  if(!i.due.isEmpty()){ TextView due=text("Scadenza: "+i.due,11,AMBER,true); due.setPadding(0,dp(9),0,0); card.addView(due); }
+                  card.setOnClickListener(v->showDetail(i)); LinearLayout outer=new LinearLayout(this); outer.addView(card,new LinearLayout.LayoutParams(-1,-2)); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-1,-2); op.setMargins(0,0,0,dp(9)); outer.setLayoutParams(op); return outer;
               }
 
               void showCapture() {
-                  String[] choices={"Scatta una foto","Scegli foto / screenshot","Importa documento","Aggiungi nota demo"};
-                  new AlertDialog.Builder(this).setTitle("Aggiungi a TEXARI").setItems(choices,(d,w)->{
-                      if(w==0)camera(); else if(w==1)pick("image/*",101); else if(w==2)pick("*/*",102); else addDemo("Nota inserita manualmente");
-                  }).setNegativeButton("Annulla",null).show();
+                  String[] choices={"Scatta foto di documento","Scegli foto / screenshot","Importa PDF o documento","Aggiungi manualmente"};
+                  new AlertDialog.Builder(this).setTitle("Aggiungi a TEXARI").setItems(choices,(d,w)->{ if(w==0)camera(); else if(w==1)pickImage(); else if(w==2)pickDocument(); else reviewDetected(new Item(),""); }).setNegativeButton("Annulla",null).show();
               }
 
-              void camera(){ if(android.os.Build.VERSION.SDK_INT>=23 && checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){ requestPermissions(new String[]{Manifest.permission.CAMERA},500); return;} try{ startActivityForResult(new Intent(MediaStore.ACTION_IMAGE_CAPTURE),100);}catch(Exception e){Toast.makeText(this,"Fotocamera non disponibile",Toast.LENGTH_SHORT).show();}}
-              void pick(String type,int code){ Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType(type); startActivityForResult(i,code); }
-              @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){ super.onRequestPermissionsResult(r,p,g); if(r==500&&g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)camera(); }
-              @Override protected void onActivityResult(int r,int c,Intent d){ super.onActivityResult(r,c,d); if(c==RESULT_OK){ if(r==100)addDemo("Foto scattata"); else if(r==101)addDemo("Foto / screenshot selezionato"); else if(r==102)addDemo("Documento importato"); } }
-              void addDemo(String source){ Item x=new Item("Nuovo elemento riconosciuto","Da organizzare · TEXARI",source,"Contesto proposto","Acquisizione reale. In questa V0.1 la comprensione AI è simulata."); items.add(0,x); showDetail(x); }
+              void camera(){
+                  if(android.os.Build.VERSION.SDK_INT>=23 && checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.CAMERA},REQ_CAMERA_PERMISSION);return;}
+                  try{
+                      File f=new File(getCacheDir(),"texari_capture_"+System.currentTimeMillis()+".jpg"); cameraUri=FileProvider.getUriForFile(this,"app.texari.evaluation.fileprovider",f); Intent i=new Intent(MediaStore.ACTION_IMAGE_CAPTURE); i.putExtra(MediaStore.EXTRA_OUTPUT,cameraUri); i.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_READ_URI_PERMISSION); startActivityForResult(i,REQ_CAMERA);
+                  }catch(Exception e){Toast.makeText(this,"Fotocamera non disponibile",Toast.LENGTH_SHORT).show();}
+              }
+
+              void pickImage(){Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT);i.addCategory(Intent.CATEGORY_OPENABLE);i.setType("image/*");startActivityForResult(i,REQ_IMAGE);}
+              void pickDocument(){Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT);i.addCategory(Intent.CATEGORY_OPENABLE);i.setType("*/*");i.putExtra(Intent.EXTRA_MIME_TYPES,new String[]{"application/pdf","image/*"});startActivityForResult(i,REQ_DOC);}
+
+              @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){super.onRequestPermissionsResult(r,p,g);if(r==REQ_CAMERA_PERMISSION&&g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)camera();}
+              @Override protected void onActivityResult(int r,int c,Intent d){super.onActivityResult(r,c,d);if(c!=RESULT_OK)return; if(r==REQ_CAMERA&&cameraUri!=null)analyzeUri(cameraUri,"Foto"); else if((r==REQ_IMAGE||r==REQ_DOC)&&d!=null&&d.getData()!=null)analyzeUri(d.getData(),r==REQ_DOC?"Documento":"Foto");}
+
+              void analyzeUri(Uri uri,String source){
+                  ProgressDialog pd=new ProgressDialog(this); pd.setMessage("TEXARI sta analizzandoâ€¦"); pd.setCancelable(false); pd.show();
+                  String mime=getContentResolver().getType(uri);
+                  if(mime!=null&&mime.equals("application/pdf")){
+                      try{Bitmap b=renderPdfFirstPage(uri); analyzeBitmap(b,source+" PDF",pd);}catch(Exception e){pd.dismiss();Item x=new Item();x.type="Documento";x.title="PDF importato";x.source=source;reviewDetected(x,"");}
+                  } else {
+                      try{InputImage image=InputImage.fromFilePath(this,uri); TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).process(image).addOnSuccessListener(t->{pd.dismiss();String raw=t.getText();reviewDetected(detect(raw,source),raw);}).addOnFailureListener(e->{pd.dismiss();Item x=new Item();x.title="Documento acquisito";x.source=source;reviewDetected(x,"");});}catch(IOException e){pd.dismiss();Toast.makeText(this,"Non riesco a leggere questo file",Toast.LENGTH_SHORT).show();}
+                  }
+              }
+
+              void analyzeBitmap(Bitmap b,String source,ProgressDialog pd){
+                  if(b==null){pd.dismiss();return;} InputImage image=InputImage.fromBitmap(b,0); TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).process(image).addOnSuccessListener(t->{pd.dismiss();String raw=t.getText();reviewDetected(detect(raw,source),raw);}).addOnFailureListener(e->{pd.dismiss();Item x=new Item();x.title="Documento acquisito";x.source=source;reviewDetected(x,"");});
+              }
+
+              Bitmap renderPdfFirstPage(Uri uri)throws Exception{
+                  ParcelFileDescriptor pfd=getContentResolver().openFileDescriptor(uri,"r"); PdfRenderer renderer=new PdfRenderer(pfd); PdfRenderer.Page pg=renderer.openPage(0); int w=Math.min(1800,pg.getWidth()*2); int h=(int)(w*((double)pg.getHeight()/pg.getWidth())); Bitmap b=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888); b.eraseColor(Color.WHITE); pg.render(b,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY); pg.close(); renderer.close(); pfd.close(); return b;
+              }
+
+              Item detect(String raw,String source){
+                  Item x=new Item(); x.source=source; x.ocr=raw==null?"":raw; String n=norm(raw);
+                  if(n.contains("fattura")||n.contains("invoice")||n.contains("bolletta")||n.contains("scadenza")) x.type="Fattura";
+                  else if(n.contains("scontrino")||n.contains("ricevuta")||n.contains("totale")||n.contains("total")) x.type="Ricevuta";
+                  else if(n.contains("prenotazione")||n.contains("booking")||n.contains("check-in")||n.contains("check in")) x.type="Prenotazione";
+                  else x.type="Documento";
+                  x.title=firstUsefulLine(raw); x.amount=findAmount(raw); x.date=findDate(raw,false); x.due=findDate(raw,true); x.category=suggestCategory(n); x.context=suggestContext(x.category); x.expense=!x.amount.isEmpty() && (x.type.equals("Fattura")||x.type.equals("Ricevuta")); x.status=!x.due.isEmpty()?"Da pagare":"Salvato";
+                  return x;
+              }
+
+              String firstUsefulLine(String raw){ if(raw==null||raw.trim().isEmpty())return "Documento acquisito"; for(String l:raw.split("\\n")){String s=l.trim(); if(s.length()>=3 && s.length()<=50 && !s.matches(".*\\d{6,}.*"))return s;} return "Documento acquisito"; }
+              String findAmount(String raw){ if(raw==null)return ""; Pattern p=Pattern.compile("(?i)(?:â‚¬|EUR|TOT(?:ALE)?[: ]*)?\\s*(\\d{1,4}(?:[.,]\\d{3})*[.,]\\d{2})"); Matcher m=p.matcher(raw); double best=-1; String out=""; while(m.find()){String s=m.group(1);double v=parseAmount(s);if(v>best&&v<100000){best=v;out=s;}} return out.replace('.',','); }
+              String findDate(String raw,boolean due){ if(raw==null)return ""; String[] lines=raw.split("\\n"); Pattern p=Pattern.compile("(\\d{1,2}[./-]\\d{1,2}[./-](?:\\d{2}|\\d{4}))"); if(due){for(String l:lines){String z=norm(l);if(z.contains("scaden")||z.contains("due")||z.contains("vence")){Matcher m=p.matcher(l);if(m.find())return normalizeDate(m.group(1));}}return "";} Matcher m=p.matcher(raw); if(m.find())return normalizeDate(m.group(1)); return ""; }
+              String normalizeDate(String s){return s.replace('.','/').replace('-','/');}
+              String suggestCategory(String n){ if(n.contains("enel")||n.contains("energia")||n.contains("electric")||n.contains("gas")||n.contains("acqua")||n.contains("internet")||n.contains("telefono"))return "Casa e utenze"; if(n.contains("supermerc")||n.contains("mercadona")||n.contains("conad")||n.contains("lidl")||n.contains("carrefour")||n.contains("aliment"))return "Alimentari"; if(n.contains("ristor")||n.contains("bar ")||n.contains("cafe")||n.contains("caffÃ¨")||n.contains("pizza"))return "Ristoranti"; if(n.contains("farmacia")||n.contains("medic")||n.contains("clinica"))return "Salute"; if(n.contains("benzina")||n.contains("carbur")||n.contains("taxi")||n.contains("uber")||n.contains("tren")||n.contains("bus"))return "Trasporti"; if(n.contains("hotel")||n.contains("booking")||n.contains("volo")||n.contains("airline"))return "Viaggi"; if(n.contains("amazon")||n.contains("negozio")||n.contains("store"))return "Acquisti"; return "Altro"; }
+              String suggestContext(String c){ if(c.equals("Casa e utenze")||c.equals("Alimentari")||c.equals("Acquisti"))return "Casa"; if(c.equals("Viaggi"))return "Viaggi"; return "Personale"; }
+
+              void reviewDetected(Item x,String raw){
+                  ScrollView sv=new ScrollView(this); LinearLayout form=new LinearLayout(this); form.setOrientation(LinearLayout.VERTICAL); form.setPadding(dp(18),dp(14),dp(18),dp(14)); sv.addView(form);
+                  form.addView(text("TEXARI ha trovato questo",22,INK,true)); TextView hint=text("Controlla e modifica liberamente. Nessun campo Ã¨ obbligatorio.",12,MUTED,false); hint.setPadding(0,dp(4),0,dp(14)); form.addView(hint);
+                  EditText type=field(form,"Tipo",x.type); EditText title=field(form,"Emittente / titolo",x.title); EditText date=field(form,"Data",x.date); EditText due=field(form,"Scadenza",x.due); EditText amount=field(form,"Importo",x.amount); EditText category=field(form,"Categoria",x.category); EditText subcategory=field(form,"Sottocategoria",x.subcategory); EditText context=field(form,"Contesto",x.context); EditText status=field(form,"Stato",x.status); EditText note=field(form,"Note",x.note);
+                  CheckBox expense=new CheckBox(this); expense.setText("Conta questo importo nelle spese mensili"); expense.setTextColor(INK); expense.setTextSize(13); expense.setChecked(x.expense); expense.setPadding(0,dp(4),0,dp(8)); form.addView(expense);
+                  LinearLayout customBox=new LinearLayout(this); customBox.setOrientation(LinearLayout.VERTICAL); form.addView(customBox);
+                  Button addField=button("+ Aggiungi campo personalizzato",VIOLET_SOFT,VIOLET); form.addView(addField,new LinearLayout.LayoutParams(-1,dp(44))); addField.setOnClickListener(v->addCustomField(customBox));
+                  if(raw!=null&&!raw.trim().isEmpty()){TextView ocrTitle=text("TESTO RICONOSCIUTO",10,MUTED,true);ocrTitle.setPadding(0,dp(16),0,dp(6));form.addView(ocrTitle);TextView ocr=text(raw.length()>700?raw.substring(0,700)+"â€¦":raw,11,MUTED,false);ocr.setBackground(round(Color.rgb(243,244,246),12));ocr.setPadding(dp(10),dp(10),dp(10),dp(10));form.addView(ocr);}
+                  AlertDialog dialog=new AlertDialog.Builder(this).setView(sv).setNegativeButton("Annulla",null).setPositiveButton("Salva",null).create();
+                  dialog.setOnShowListener(d->{Button save=dialog.getButton(AlertDialog.BUTTON_POSITIVE); save.setOnClickListener(v->{x.type=type.getText().toString().trim();x.title=title.getText().toString().trim();x.date=date.getText().toString().trim();x.due=due.getText().toString().trim();x.amount=amount.getText().toString().trim();x.category=category.getText().toString().trim();x.subcategory=subcategory.getText().toString().trim();x.context=context.getText().toString().trim();x.status=status.getText().toString().trim();x.note=note.getText().toString().trim();x.expense=expense.isChecked();items.add(0,x);saveItems();dialog.dismiss();Toast.makeText(this,"Salvato in TEXARI",Toast.LENGTH_SHORT).show();active="Oggi";rebuildNav();showToday();});}); dialog.show(); Window win=dialog.getWindow(); if(win!=null)win.setLayout(WindowManager.LayoutParams.MATCH_PARENT,WindowManager.LayoutParams.WRAP_CONTENT);
+              }
+
+              EditText field(LinearLayout form,String label,String value){ TextView l=text(label,11,MUTED,true); l.setPadding(0,dp(7),0,dp(3)); form.addView(l); EditText e=input(label); e.setText(value); e.setSingleLine(true); form.addView(e,new LinearLayout.LayoutParams(-1,dp(48))); return e; }
+              void addCustomField(LinearLayout box){ LinearLayout row=new LinearLayout(this);row.setOrientation(LinearLayout.HORIZONTAL);EditText k=input("Nome campo");EditText v=input("Valore");LinearLayout.LayoutParams a=new LinearLayout.LayoutParams(0,dp(48),1);a.setMargins(0,dp(6),dp(4),0);LinearLayout.LayoutParams b=new LinearLayout.LayoutParams(0,dp(48),1);b.setMargins(dp(4),dp(6),0,0);row.addView(k,a);row.addView(v,b);box.addView(row); }
 
               void showDetail(Item i){
-                  LinearLayout box=box(BG,26); box.setPadding(dp(22),dp(20),dp(22),dp(20)); box.addView(text("texari",19,VIOLET,true)); space(box,12); box.addView(text(i.badge,12,VIOLET,true)); space(box,12); box.addView(text(i.title,26,INK,true)); TextView st=text(i.subtitle,13,MUTED,false); st.setPadding(0,dp(5),0,dp(15)); box.addView(st); box.addView(text(i.meta,15,INK,true)); TextView de=text(i.detail,14,MUTED,false); de.setPadding(0,dp(8),0,dp(16)); box.addView(de); LinearLayout ctxt=box(VIOLET_SOFT,16); ctxt.setPadding(dp(14),dp(14),dp(14),dp(14)); ctxt.addView(text("CONTESTO",10,VIOLET,true)); ctxt.addView(text("TEXARI collega automaticamente ciò che appartiene alla stessa parte della tua vita.",13,Color.rgb(85,78,164),false)); box.addView(ctxt); new AlertDialog.Builder(this).setView(box).setPositiveButton("Salva",null).setNegativeButton("Chiudi",null).show();
+                  ScrollView sv=new ScrollView(this); LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(20),dp(18),dp(20),dp(18)); sv.addView(box); box.addView(text(i.type.toUpperCase(Locale.ROOT),11,VIOLET,true)); space(box,8); box.addView(text(i.title,24,INK,true)); detailRow(box,"Data",i.date); detailRow(box,"Scadenza",i.due); detailRow(box,"Importo",i.amount.isEmpty()?"":"â‚¬"+i.amount); detailRow(box,"Categoria",i.category+(i.subcategory.isEmpty()?"":" Â· "+i.subcategory)); detailRow(box,"Contesto",i.context); detailRow(box,"Stato",i.status); if(!i.note.isEmpty())detailRow(box,"Note",i.note); new AlertDialog.Builder(this).setView(sv).setPositiveButton("Chiudi",null).setNeutralButton("Modifica",(d,w)->reviewEdit(i)).show();
               }
+              void reviewEdit(Item i){ items.remove(i); saveItems(); reviewDetected(i,i.ocr); }
+              void detailRow(LinearLayout b,String k,String v){ if(v==null||v.isEmpty())return; TextView a=text(k.toUpperCase(Locale.ROOT),10,MUTED,true);a.setPadding(0,dp(14),0,dp(2));b.addView(a);b.addView(text(v,14,INK,false)); }
 
+              EditText input(String hint){ EditText e=new EditText(this); e.setHint(hint); e.setHintTextColor(Color.rgb(155,160,170)); e.setTextColor(INK); e.setTextSize(14); e.setPadding(dp(11),0,dp(11),0); e.setBackground(round(Color.rgb(245,245,247),12)); return e; }
               TextView text(String value,float size,int color,boolean bold){ TextView t=new TextView(this); t.setText(value); t.setTextSize(size); t.setTextColor(color); if(bold)t.setTypeface(Typeface.DEFAULT,Typeface.BOLD); t.setLineSpacing(0,1.08f); return t; }
               Button button(String value,int bg,int fg){ Button b=new Button(this); b.setText(value); b.setTextSize(13); b.setTextColor(fg); b.setAllCaps(false); b.setTypeface(Typeface.DEFAULT,Typeface.BOLD); b.setBackground(round(bg,14)); return b; }
               LinearLayout box(int color,int radius){ LinearLayout l=new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); l.setBackground(round(color,radius)); return l; }
               GradientDrawable round(int color,int radius){ GradientDrawable g=new GradientDrawable(); g.setColor(color); g.setCornerRadius(dp(radius)); return g; }
               void space(LinearLayout l,int h){ View v=new View(this); l.addView(v,new LinearLayout.LayoutParams(1,dp(h))); }
               int dp(int v){ return v*px; }
+              String norm(String s){ if(s==null)return ""; String n=Normalizer.normalize(s,Normalizer.Form.NFD).replaceAll("\\p{M}",""); return n.toLowerCase(Locale.ROOT).trim(); }
+              double parseAmount(String s){ if(s==null||s.trim().isEmpty())return 0; try{return Double.parseDouble(s.replace("â‚¬","").replace(" ","").replace(".","").replace(',','.'));}catch(Exception e){return 0;} }
+              String euro(double v){return String.format(Locale.ITALY,"â‚¬ %.2f",v);}
           }
           EOF
 
@@ -269,11 +458,11 @@ jobs:
         run: gradle :app:assembleDebug --no-daemon
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk TEXARI-evaluation.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk TEXARI-v0.2-evaluation.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: TEXARI-evaluation-APK
-          path: TEXARI-evaluation.apk
+          name: TEXARI-v0.2-evaluation-APK
+          path: TEXARI-v0.2-evaluation.apk
           retention-days: 14

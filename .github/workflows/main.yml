@@ -1,0 +1,279 @@
+name: Build TEXARI Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create native TEXARI evaluation app
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/app/texari/evaluation
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'TexariEvaluation'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'app.texari.evaluation'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'app.texari.evaluation'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.1.0'
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <application android:allowBackup="true" android:label="TEXARI" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false"> <activity android:name=".MainActivity" android:screenOrientation="portrait" android:exported="true"> <intent-filter> <action android:name="android.intent.action.MAIN" /> <category android:name="android.intent.category.LAUNCHER" /> </intent-filter> </activity> </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/app/texari/evaluation/MainActivity.java <<'EOF'
+          package app.texari.evaluation;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.provider.MediaStore;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              static final int INK = Color.rgb(21,32,50);
+              static final int MUTED = Color.rgb(107,114,128);
+              static final int BG = Color.rgb(246,245,241);
+              static final int CARD = Color.WHITE;
+              static final int VIOLET = Color.rgb(111,99,232);
+              static final int VIOLET_SOFT = Color.rgb(236,234,254);
+              static final int GREEN = Color.rgb(61,124,104);
+              static final int AMBER = Color.rgb(169,107,44);
+
+              LinearLayout root, content, nav;
+              String active = "Oggi";
+              int px;
+              final List<Item> items = new ArrayList<>();
+
+              static class Item {
+                  String title, subtitle, meta, badge, detail;
+                  Item(String t, String s, String m, String b, String d) { title=t; subtitle=s; meta=m; badge=b; detail=d; }
+              }
+
+              @Override public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  px = (int)getResources().getDisplayMetrics().density;
+                  Window w = getWindow();
+                  w.setStatusBarColor(BG);
+                  w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+                  seed();
+                  buildShell();
+                  showToday();
+              }
+
+              void seed() {
+                  items.add(new Item("Macchina del caffè De'Longhi", "Casa · Cucina", "€549 · 2 set 2026", "Reso tra 6 giorni", "Ricevuta salvata · Garanzia rilevata"));
+                  items.add(new Item("Hotel Roma", "Viaggi · Roma", "21–23 settembre", "Tra 16 giorni", "Prenotazione · Check-in 15:00"));
+                  items.add(new Item("Misura finestra bagno", "Casa · Bagno", "87 × 120 cm", "Contesto salvato", "Nota collegata al progetto Casa"));
+              }
+
+              void buildShell() {
+                  root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(BG);
+                  content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL);
+                  root.addView(content, new LinearLayout.LayoutParams(-1,0,1));
+                  nav = new LinearLayout(this); nav.setOrientation(LinearLayout.HORIZONTAL); nav.setGravity(Gravity.CENTER); nav.setPadding(dp(8),dp(5),dp(8),dp(8)); nav.setBackgroundColor(CARD);
+                  root.addView(nav, new LinearLayout.LayoutParams(-1,dp(76)));
+                  setContentView(root);
+                  rebuildNav();
+              }
+
+              void rebuildNav() {
+                  nav.removeAllViews();
+                  nav.addView(navButton("Oggi"), weighted());
+                  nav.addView(navButton("Contesti"), weighted());
+                  Button add = new Button(this); add.setText("+"); add.setTextSize(28); add.setTextColor(Color.WHITE); add.setAllCaps(false); add.setBackground(round(VIOLET,20)); add.setOnClickListener(v -> showCapture());
+                  LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(dp(58),dp(58)); ap.setMargins(dp(4),0,dp(4),dp(10)); nav.addView(add, ap);
+                  nav.addView(navButton("Chiedi"), weighted());
+                  nav.addView(navButton("Tu"), weighted());
+              }
+
+              LinearLayout.LayoutParams weighted() { return new LinearLayout.LayoutParams(0,-1,1); }
+              View navButton(String name) {
+                  TextView t = text(name,11, active.equals(name)?VIOLET:MUTED, true);
+                  t.setGravity(Gravity.CENTER); t.setPadding(0,dp(10),0,0);
+                  t.setOnClickListener(v -> { active=name; rebuildNav(); if(name.equals("Oggi"))showToday(); else if(name.equals("Contesti"))showContexts(); else if(name.equals("Chiedi"))showAsk(); else showProfile(); });
+                  return t;
+              }
+
+              void pageStart(String title, String subtitle) {
+                  content.removeAllViews();
+                  ScrollView sv = new ScrollView(this); sv.setFillViewport(true);
+                  LinearLayout page = new LinearLayout(this); page.setOrientation(LinearLayout.VERTICAL); page.setPadding(dp(20),dp(22),dp(20),dp(30)); sv.addView(page);
+                  page.addView(text("texari",20,VIOLET,true));
+                  space(page,18);
+                  page.addView(text(title,34,INK,true));
+                  TextView sub = text(subtitle,14,MUTED,false); sub.setPadding(0,dp(8),0,dp(22)); page.addView(sub);
+                  content.addView(sv,new LinearLayout.LayoutParams(-1,-1));
+                  content.setTag(page);
+              }
+
+              LinearLayout page() { return (LinearLayout)content.getTag(); }
+
+              void showToday() {
+                  pageStart("Quello che conta, oggi.", "TEXARI riporta in superficie le cose utili nel momento in cui servono.");
+                  LinearLayout p=page();
+                  LinearLayout hero = box(INK,28); hero.setPadding(dp(22),dp(22),dp(22),dp(22));
+                  hero.addView(text("IN EVIDENZA",11,Color.rgb(185,180,255),true));
+                  TextView ht=text("Hai ancora 6 giorni per decidere sulla De'Longhi.",24,Color.WHITE,true); ht.setPadding(0,dp(10),0,dp(8)); hero.addView(ht);
+                  hero.addView(text("Ricevuta e garanzia sono già nello stesso contesto.",14,Color.rgb(200,206,216),false));
+                  Button open=button("Apri contesto",Color.WHITE,INK); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-2,dp(45)); op.setMargins(0,dp(18),0,0); hero.addView(open,op); open.setOnClickListener(v->showDetail(items.get(0)));
+                  p.addView(hero,new LinearLayout.LayoutParams(-1,-2)); space(p,25);
+                  p.addView(text("Prossimamente",18,INK,true)); space(p,10);
+                  for(int i=0;i<Math.min(3,items.size());i++) p.addView(itemCard(items.get(i)));
+                  LinearLayout insight=box(Color.rgb(232,242,238),20); insight.setPadding(dp(17),dp(17),dp(17),dp(17)); insight.addView(text("TEXARI ha collegato qualcosa",15,GREEN,true)); TextView it=text("La ricevuta, la garanzia e la cucina ora appartengono allo stesso contesto.",13,Color.rgb(69,103,93),false); it.setPadding(0,dp(5),0,0); insight.addView(it); p.addView(insight);
+              }
+
+              void showContexts() {
+                  pageStart("I tuoi contesti.", "Non cartelle: gruppi di cose che hanno senso insieme.");
+                  LinearLayout p=page();
+                  contextRow(p,"Casa","8 elementi","Misure · acquisti · garanzie");
+                  contextRow(p,"Viaggi","3 elementi","Prenotazioni · luoghi · idee");
+                  contextRow(p,"Acquisti","6 elementi","Ricevute · resi · prodotti");
+                  contextRow(p,"Documenti","4 elementi","PDF · scadenze · note");
+                  space(p,18); p.addView(text("Tutto ciò che hai salvato",18,INK,true)); space(p,10);
+                  for(Item i:items)p.addView(itemCard(i));
+              }
+
+              void contextRow(LinearLayout p,String a,String b,String c) {
+                  LinearLayout row=box(CARD,19); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(dp(16),dp(15),dp(16),dp(15));
+                  TextView dot=text("●",15,VIOLET,true); row.addView(dot,new LinearLayout.LayoutParams(dp(28),-2));
+                  LinearLayout mid=new LinearLayout(this); mid.setOrientation(LinearLayout.VERTICAL); mid.addView(text(a,17,INK,true)); mid.addView(text(c,12,MUTED,false)); row.addView(mid,new LinearLayout.LayoutParams(0,-2,1)); row.addView(text(b,12,MUTED,false));
+                  LinearLayout.LayoutParams rp=new LinearLayout.LayoutParams(-1,-2); rp.setMargins(0,0,0,dp(9)); p.addView(row,rp);
+              }
+
+              void showAsk() {
+                  pageStart("Chiedi a TEXARI.", "Non devi ricordare il nome del file. Descrivi semplicemente ciò che stai cercando.");
+                  LinearLayout p=page();
+                  LinearLayout ask=box(CARD,20); ask.setPadding(dp(15),dp(15),dp(15),dp(15));
+                  EditText q=new EditText(this); q.setHint("Es. Quanto avevo pagato la macchina del caffè?"); q.setTextColor(INK); q.setHintTextColor(Color.rgb(148,153,163)); q.setTextSize(15); q.setMinHeight(dp(90)); q.setGravity(Gravity.TOP); q.setBackgroundColor(Color.TRANSPARENT); ask.addView(q,new LinearLayout.LayoutParams(-1,-2));
+                  Button send=button("Chiedi",VIOLET,Color.WHITE); ask.addView(send,new LinearLayout.LayoutParams(-1,dp(48))); p.addView(ask);
+                  TextView answer=text("",15,Color.WHITE,false); LinearLayout answerBox=box(INK,20); answerBox.setPadding(dp(18),dp(18),dp(18),dp(18)); LinearLayout.LayoutParams abp=new LinearLayout.LayoutParams(-1,-2); abp.setMargins(0,dp(14),0,0); answerBox.addView(answer); p.addView(answerBox,abp); answerBox.setVisibility(View.GONE);
+                  send.setOnClickListener(v->{ String z=q.getText().toString().toLowerCase(); String r; if(z.contains("caff")||z.contains("delonghi"))r="Hai salvato una De'Longhi da €549, acquistata il 2 settembre. Ricevuta e garanzia sono collegate a Casa → Cucina."; else if(z.contains("finestra")||z.contains("bagno"))r="La misura salvata per la finestra del bagno è 87 × 120 cm."; else if(z.contains("roma")||z.contains("hotel"))r="Hai una prenotazione a Roma dal 21 al 23 settembre, con check-in alle 15:00."; else r="Questa è la V0.1 dimostrativa. La prossima versione collegherà davvero l'AI alla tua memoria personale."; answer.setText(r); answerBox.setVisibility(View.VISIBLE); });
+              }
+
+              void showProfile() {
+                  pageStart("Il tuo TEXARI.", "Una memoria personale costruita intorno al tuo contesto.");
+                  LinearLayout p=page();
+                  LinearLayout profile=box(CARD,20); profile.setPadding(dp(18),dp(18),dp(18),dp(18)); profile.addView(text("A",24,VIOLET,true),new LinearLayout.LayoutParams(dp(50),dp(50))); LinearLayout info=new LinearLayout(this); info.setOrientation(LinearLayout.VERTICAL); info.addView(text("Profilo di valutazione",16,INK,true)); info.addView(text("TEXARI V0.1 · locale",12,MUTED,false)); profile.addView(info); p.addView(profile);
+                  space(p,24); p.addView(text("Principi del prodotto",18,INK,true));
+                  setting(p,"Privato per impostazione predefinita"); setting(p,"Tu scegli cosa salvare"); setting(p,"Le fonti restano sempre visibili"); setting(p,"L'AI propone, tu confermi");
+              }
+
+              void setting(LinearLayout p,String x){ LinearLayout r=new LinearLayout(this); r.setOrientation(LinearLayout.HORIZONTAL); r.setPadding(0,dp(14),0,dp(14)); r.addView(text("✓",17,GREEN,true),new LinearLayout.LayoutParams(dp(28),-2)); r.addView(text(x,14,INK,false)); p.addView(r); }
+
+              View itemCard(Item i) {
+                  LinearLayout card=box(CARD,20); card.setPadding(dp(16),dp(16),dp(16),dp(16));
+                  card.addView(text(i.title,16,INK,true)); TextView sub=text(i.subtitle,12,MUTED,false); sub.setPadding(0,dp(3),0,dp(13)); card.addView(sub); card.addView(text(i.meta,14,INK,false)); TextView badge=text(i.badge,11,VIOLET,true); badge.setPadding(dp(10),dp(7),dp(10),dp(7)); badge.setBackground(round(VIOLET_SOFT,50)); LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2); bp.setMargins(0,dp(12),0,0); card.addView(badge,bp); card.setOnClickListener(v->showDetail(i)); LinearLayout outer=new LinearLayout(this); outer.addView(card,new LinearLayout.LayoutParams(-1,-2)); LinearLayout.LayoutParams op=new LinearLayout.LayoutParams(-1,-2); op.setMargins(0,0,0,dp(10)); outer.setLayoutParams(op); return outer;
+              }
+
+              void showCapture() {
+                  String[] choices={"Scatta una foto","Scegli foto / screenshot","Importa documento","Aggiungi nota demo"};
+                  new AlertDialog.Builder(this).setTitle("Aggiungi a TEXARI").setItems(choices,(d,w)->{
+                      if(w==0)camera(); else if(w==1)pick("image/*",101); else if(w==2)pick("*/*",102); else addDemo("Nota inserita manualmente");
+                  }).setNegativeButton("Annulla",null).show();
+              }
+
+              void camera(){ if(android.os.Build.VERSION.SDK_INT>=23 && checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){ requestPermissions(new String[]{Manifest.permission.CAMERA},500); return;} try{ startActivityForResult(new Intent(MediaStore.ACTION_IMAGE_CAPTURE),100);}catch(Exception e){Toast.makeText(this,"Fotocamera non disponibile",Toast.LENGTH_SHORT).show();}}
+              void pick(String type,int code){ Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType(type); startActivityForResult(i,code); }
+              @Override public void onRequestPermissionsResult(int r,String[] p,int[] g){ super.onRequestPermissionsResult(r,p,g); if(r==500&&g.length>0&&g[0]==PackageManager.PERMISSION_GRANTED)camera(); }
+              @Override protected void onActivityResult(int r,int c,Intent d){ super.onActivityResult(r,c,d); if(c==RESULT_OK){ if(r==100)addDemo("Foto scattata"); else if(r==101)addDemo("Foto / screenshot selezionato"); else if(r==102)addDemo("Documento importato"); } }
+              void addDemo(String source){ Item x=new Item("Nuovo elemento riconosciuto","Da organizzare · TEXARI",source,"Contesto proposto","Acquisizione reale. In questa V0.1 la comprensione AI è simulata."); items.add(0,x); showDetail(x); }
+
+              void showDetail(Item i){
+                  LinearLayout box=box(BG,26); box.setPadding(dp(22),dp(20),dp(22),dp(20)); box.addView(text("texari",19,VIOLET,true)); space(box,12); box.addView(text(i.badge,12,VIOLET,true)); space(box,12); box.addView(text(i.title,26,INK,true)); TextView st=text(i.subtitle,13,MUTED,false); st.setPadding(0,dp(5),0,dp(15)); box.addView(st); box.addView(text(i.meta,15,INK,true)); TextView de=text(i.detail,14,MUTED,false); de.setPadding(0,dp(8),0,dp(16)); box.addView(de); LinearLayout ctxt=box(VIOLET_SOFT,16); ctxt.setPadding(dp(14),dp(14),dp(14),dp(14)); ctxt.addView(text("CONTESTO",10,VIOLET,true)); ctxt.addView(text("TEXARI collega automaticamente ciò che appartiene alla stessa parte della tua vita.",13,Color.rgb(85,78,164),false)); box.addView(ctxt); new AlertDialog.Builder(this).setView(box).setPositiveButton("Salva",null).setNegativeButton("Chiudi",null).show();
+              }
+
+              TextView text(String value,float size,int color,boolean bold){ TextView t=new TextView(this); t.setText(value); t.setTextSize(size); t.setTextColor(color); if(bold)t.setTypeface(Typeface.DEFAULT,Typeface.BOLD); t.setLineSpacing(0,1.08f); return t; }
+              Button button(String value,int bg,int fg){ Button b=new Button(this); b.setText(value); b.setTextSize(13); b.setTextColor(fg); b.setAllCaps(false); b.setTypeface(Typeface.DEFAULT,Typeface.BOLD); b.setBackground(round(bg,14)); return b; }
+              LinearLayout box(int color,int radius){ LinearLayout l=new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); l.setBackground(round(color,radius)); return l; }
+              GradientDrawable round(int color,int radius){ GradientDrawable g=new GradientDrawable(); g.setColor(color); g.setCornerRadius(dp(radius)); return g; }
+              void space(LinearLayout l,int h){ View v=new View(this); l.addView(v,new LinearLayout.LayoutParams(1,dp(h))); }
+              int dp(int v){ return v*px; }
+          }
+          EOF
+
+      - name: Install Android platform
+        run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" >/dev/null
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk TEXARI-evaluation.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEXARI-evaluation-APK
+          path: TEXARI-evaluation.apk
+          retention-days: 14

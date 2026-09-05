@@ -370,3 +370,20 @@ jobs:
           
               void showContexts() {
     
+      - name: Install Android platform
+        shell: bash
+        run: |
+          yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" >/dev/null || true
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk TEXARI-v0.2-evaluation.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEXARI-v0.2-evaluation-APK
+          path: TEXARI-v0.2-evaluation.apk
+          retention-days: 14

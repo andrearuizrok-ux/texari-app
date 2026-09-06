@@ -42,17 +42,13 @@ jobs:
         env:
           KEYSTORE_B64_RAW: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
           STORE_PASSWORD_RAW: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
-          KEY_ALIAS_RAW: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
-          KEY_PASSWORD_RAW: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
         run: |
           test -n "$KEYSTORE_B64_RAW" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_B64" && exit 1)
           test -n "$STORE_PASSWORD_RAW" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_PASSWORD" && exit 1)
-          test -n "$KEY_ALIAS_RAW" || (echo "Missing ANDROID_UPLOAD_KEY_ALIAS" && exit 1)
-          test -n "$KEY_PASSWORD_RAW" || (echo "Missing ANDROID_UPLOAD_KEY_PASSWORD" && exit 1)
 
-          STORE_PASSWORD="$(printf '%s' "$STORE_PASSWORD_RAW" | tr -d '\r\n')"
-          KEY_ALIAS="$(printf '%s' "$KEY_ALIAS_RAW" | tr -d '\r\n')"
-          KEY_PASSWORD="$(printf '%s' "$KEY_PASSWORD_RAW" | tr -d '\r\n')"
+          STORE_PASSWORD="$(printf '%s' "$STORE_PASSWORD_RAW" | tr -d '[:space:]')"
+          KEY_ALIAS="texari-upload"
+          KEY_PASSWORD="$STORE_PASSWORD"
           printf '%s' "$KEYSTORE_B64_RAW" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/texari-upload-key.jks"
 
           ACTUAL_SHA="$(sha256sum "$RUNNER_TEMP/texari-upload-key.jks" | awk '{print $1}')"
@@ -62,8 +58,13 @@ jobs:
             exit 1
           fi
 
+          if ! keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" >/dev/null 2>&1; then
+            echo "Keystore password is incorrect. Update ANDROID_UPLOAD_KEYSTORE_PASSWORD with the exact Keystore password from the private TEXARI credentials file."
+            exit 1
+          fi
+
           if ! keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
-            echo "Signing key opened incorrectly. Check keystore password and alias."
+            echo "Keystore opened, but the expected alias texari-upload was not found."
             exit 1
           fi
 

@@ -54,35 +54,50 @@ jobs:
           ACTUAL_SHA="$(sha256sum "$RUNNER_TEMP/texari-upload-key.jks" | awk '{print $1}')"
           EXPECTED_SHA="1670edbc806f257a5cb2b3cdc60505a060f03b1c66ca8f62be40efd21f137360"
           if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-            echo "Signing key content does not match the TEXARI upload key backup. Update ANDROID_UPLOAD_KEYSTORE_B64."
+            echo "Signing key content does not match the TEXARI upload key backup."
             exit 1
           fi
 
-          if ! keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" >/dev/null 2>&1; then
-            echo "Keystore password is incorrect. Update ANDROID_UPLOAD_KEYSTORE_PASSWORD with the exact Keystore password from the private TEXARI credentials file."
-            exit 1
-          fi
-
-          if ! keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
-            echo "Keystore opened, but the expected alias texari-upload was not found."
-            exit 1
-          fi
+          keytool -list \
+            -keystore "$RUNNER_TEMP/texari-upload-key.jks" \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
 
           echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/texari-upload-key.jks" >> "$GITHUB_ENV"
           echo "ANDROID_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
 
-      - name: Build beta APK and signed Play AAB
+      - name: Build beta APK and release AAB
         run: gradle :app:assembleDebug :app:bundleRelease --no-daemon
 
-      - name: Verify signed AAB
-        run: jarsigner -verify -certs app/build/outputs/bundle/release/app-release.aab
+      - name: Sign Play AAB explicitly
+        shell: bash
+        run: |
+          jarsigner \
+            -keystore "$ANDROID_KEYSTORE_PATH" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -keypass "$ANDROID_KEY_PASSWORD" \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            app/build/outputs/bundle/release/app-release.aab \
+            "$ANDROID_KEY_ALIAS"
+
+      - name: Verify Play AAB is actually signed
+        shell: bash
+        run: |
+          set -o pipefail
+          jarsigner -verify -verbose -certs app/build/outputs/bundle/release/app-release.aab | tee /tmp/texari-signature-check.txt
+          grep -q "jar verified\." /tmp/texari-signature-check.txt
+          if grep -q "jar is unsigned" /tmp/texari-signature-check.txt; then
+            echo "ERROR: AAB is unsigned"
+            exit 1
+          fi
 
       - name: Collect outputs
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk TEXARI-v0.9-beta.apk
-          cp app/build/outputs/bundle/release/app-release.aab TEXARI-v0.9-play-beta.aab
+          cp app/build/outputs/bundle/release/app-release.aab TEXARI-v0.9-play-beta-SIGNED.aab
 
       - name: Upload beta APK
         uses: actions/upload-artifact@v4
@@ -91,9 +106,9 @@ jobs:
           path: TEXARI-v0.9-beta.apk
           retention-days: 14
 
-      - name: Upload Play AAB
+      - name: Upload signed Play AAB
         uses: actions/upload-artifact@v4
         with:
-          name: TEXARI-v0.9-play-beta-AAB
-          path: TEXARI-v0.9-play-beta.aab
+          name: TEXARI-v0.9-play-beta-SIGNED-AAB
+          path: TEXARI-v0.9-play-beta-SIGNED.aab
           retention-days: 14

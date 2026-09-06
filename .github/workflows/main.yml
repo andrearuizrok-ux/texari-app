@@ -37,27 +37,42 @@ jobs:
       - name: Install Android 16 platform
         run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" >/dev/null || true
 
-      - name: Validate Play signing secrets
+      - name: Prepare and validate Play signing
         shell: bash
         env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+          KEYSTORE_B64_RAW: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_B64 }}
+          STORE_PASSWORD_RAW: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          KEY_ALIAS_RAW: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD_RAW: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
         run: |
-          test -n "$KEYSTORE_B64" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_B64" && exit 1)
-          test -n "$STORE_PASSWORD" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_PASSWORD" && exit 1)
-          test -n "$KEY_ALIAS" || (echo "Missing ANDROID_UPLOAD_KEY_ALIAS" && exit 1)
-          test -n "$KEY_PASSWORD" || (echo "Missing ANDROID_UPLOAD_KEY_PASSWORD" && exit 1)
-          echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/texari-upload-key.jks"
-          keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          test -n "$KEYSTORE_B64_RAW" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_B64" && exit 1)
+          test -n "$STORE_PASSWORD_RAW" || (echo "Missing ANDROID_UPLOAD_KEYSTORE_PASSWORD" && exit 1)
+          test -n "$KEY_ALIAS_RAW" || (echo "Missing ANDROID_UPLOAD_KEY_ALIAS" && exit 1)
+          test -n "$KEY_PASSWORD_RAW" || (echo "Missing ANDROID_UPLOAD_KEY_PASSWORD" && exit 1)
+
+          STORE_PASSWORD="$(printf '%s' "$STORE_PASSWORD_RAW" | tr -d '\r\n')"
+          KEY_ALIAS="$(printf '%s' "$KEY_ALIAS_RAW" | tr -d '\r\n')"
+          KEY_PASSWORD="$(printf '%s' "$KEY_PASSWORD_RAW" | tr -d '\r\n')"
+          printf '%s' "$KEYSTORE_B64_RAW" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/texari-upload-key.jks"
+
+          ACTUAL_SHA="$(sha256sum "$RUNNER_TEMP/texari-upload-key.jks" | awk '{print $1}')"
+          EXPECTED_SHA="1670edbc806f257a5cb2b3cdc60505a060f03b1c66ca8f62be40efd21f137360"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "Signing key content does not match the TEXARI upload key backup. Update ANDROID_UPLOAD_KEYSTORE_B64."
+            exit 1
+          fi
+
+          if ! keytool -list -keystore "$RUNNER_TEMP/texari-upload-key.jks" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "Signing key opened incorrectly. Check keystore password and alias."
+            exit 1
+          fi
+
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/texari-upload-key.jks" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
 
       - name: Build beta APK and signed Play AAB
-        env:
-          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/texari-upload-key.jks
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
         run: gradle :app:assembleDebug :app:bundleRelease --no-daemon
 
       - name: Verify signed AAB
